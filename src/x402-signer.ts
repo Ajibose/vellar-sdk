@@ -30,6 +30,7 @@ import {
   assertValidCapabilityRules,
   type CapabilityRule,
 } from "./x402-signer-capabilities";
+import { MissingPolicyCosignerError } from "./x402-types";
 
 // ── signer audit hook ──────────────────────────────────────────────────────────
 //
@@ -205,6 +206,93 @@ function comparePolicyAddresses(a: string, b: string): number {
   return ab.length - bb.length;
 }
 
+// ── the policy-governed failure mode (issue #387) ────────────────────────
+//
+// A policy-governed key configured WITHOUT its policies produces a signature
+// map the wallet rejects outright with `Error(Contract, #110)` — the wallet's
+// GENERIC auth-failure wrapper. It reads as a broken signer rather than a
+// missing co-signer, and #110 also covers policy refusals (over budget), so
+// the code alone cannot say which fix applies. What we CAN do is (a) let the
+// caller declare `policyGoverned` and warn on the impossible combination, and
+// (b) classify the rejection when it comes back and name the actual cause.
+
+/** The hint embedded in every missing-co-signer error, for tests and greppers. */
+export const MISSING_POLICY_COSIGNER_HINT =
+  "this signer may require policies to be configured";
+
+/**
+ * Diagnostics that show a POLICY CONTRACT was invoked and refused — i.e. the
+ * signature map reached the policy and the policy said no (over budget). Kept
+ * identical in shape to `SmartAccountAuthError`'s classifier in
+ * packages/mcp-x402-payer, so both surfaces of this SDK agree on what a policy
+ * refusal looks like:
+ *
+ *   [wallet] "contract try_call failed", policy__, [ …transfer args… ]
+ *   [policy] "VM call trapped with HostError", policy__, Error(Contract, #1)
+ */
+const POLICY_INVOKED_PATTERN = /try_call failed.*policy__|policy__.*Error\(Contract, #1\)/s;
+
+/**
+ * Does this failure look like a signature map MISSING its policy co-signers,
+ * rather than a policy refusing the payment?
+ *
+ * True only when the wallet's generic auth wrapper `Error(Contract, #110)` is
+ * present AND the diagnostics show no policy was ever invoked — a policy
+ * refusal produces the same #110 with a nested `policy__` call, and must NOT
+ * be classified as a configuration error. Imperfect by nature (a facilitator
+ * that truncates diagnostics looks like a missing co-signer), so the resulting
+ * error always carries the raw text and points at the alternative cause too.
+ */
+export function looksLikeMissingPolicyCosigner(detail: string): boolean {
+  if (!detail.includes("Error(Contract, #110)")) return false;
+  return !POLICY_INVOKED_PATTERN.test(detail);
+}
+
+/**
+ * Build the typed error for a #110 that lacks a policy invocation. The message
+ * names the fix (configure `policies` on the signer), the hint phrase, and the
+ * alternative cause (a policy refusing an over-budget payment), so an operator
+ * holding only this error can tell both apart.
+ */
+export function missingPolicyCosignerError(detail: string): MissingPolicyCosignerError {
+  return new MissingPolicyCosignerError(
+    `The wallet rejected this signature because the signing key's required policy ` +
+      `co-signers are missing from the signature map — ${MISSING_POLICY_COSIGNER_HINT}. ` +
+      "Pass every policy in the key's `SignerLimits` as `policies` to createSessionKeySigner " +
+      "(or createPasskeyX402Signer) and sign again. " +
+      "The wallet wraps EVERY auth failure in this same contract error, including a policy " +
+      "refusing an over-budget payment — so if the signer IS configured with its policies, " +
+      "the cause is more likely a policy refusal than a missing co-signer. " +
+      "Nothing was signed or settled by this rejection." +
+      `\n\n${detail}`,
+  );
+}
+
+/**
+ * Warn (never refuse) when a key DECLARED policy-governed carries no policies.
+ *
+ * The SDK cannot read the wallet's on-chain `SignerLimits` — that needs an RPC
+ * round-trip and a wallet-contract client the x402 signer deliberately does
+ * not own — so the caller states whether the key is policy governed and this
+ * catches the one combination that cannot work on chain. A warning, not a
+ * throw: refusing to construct would break callers that inspect or retry
+ * before configuring, and the misconfiguration is caught again — with the full
+ * raw diagnostics — by `missingPolicyCosignerError` at fetch time.
+ */
+function warnIfPolicyGovernedWithoutPolicies(
+  signerKind: string,
+  policies: readonly string[],
+  policyGoverned: boolean | undefined,
+): void {
+  if (policyGoverned !== true || policies.length > 0) return;
+  console.warn(
+    `[vellar-sdk] ${signerKind}: policyGoverned is set but \`policies\` is empty. ` +
+      "A policy-governed key signs with an incomplete signature map, which the wallet rejects " +
+      "with Error(Contract, #110) before the policy is ever consulted. Pass every policy in " +
+      "the key's SignerLimits as `policies`.",
+  );
+}
+
 // ── agent (ed25519) signer ─────────────────────────────────────────────────────
 
 export interface SessionKeySignerConfig {
@@ -228,6 +316,7 @@ export interface SessionKeySignerConfig {
    * to keep a tamper-evident record of who authorized or was denied which payment.
    */
   onSignerAction?: X402SignerActionHook;
+  /**
    * Client-side capability scoping (#224): restrict which resource
    * type (contract) + action (function name) combinations this signer will
    * sign, independent of the on-chain policy. Omit for no scoping (signs
@@ -235,6 +324,14 @@ export interface SessionKeySignerConfig {
    * for what this does and does not guarantee.
    */
   capabilities?: readonly CapabilityRule[];
+  /**
+   * Declare whether the key is policy governed on chain (its `SignerLimits`
+   * require policy co-signers). Optional, because the SDK cannot read the
+   * wallet's signer state. When `true` with an empty `policies`, construction
+   * warns — that combination is rejected on chain with the opaque
+   * `Error(Contract, #110)`, and the warning is the earliest signal available.
+   */
+  policyGoverned?: boolean;
 }
 
 /**
@@ -255,6 +352,7 @@ export function createSessionKeySigner(config: SessionKeySignerConfig): SmartAcc
       throw new Error(`policy address must be a contract (C…): got ${policy}`);
     }
   }
+  warnIfPolicyGovernedWithoutPolicies("createSessionKeySigner", policies, config.policyGoverned);
 
   const onAction = config.onSignerAction;
   const fire = (
@@ -272,6 +370,8 @@ export function createSessionKeySigner(config: SessionKeySignerConfig): SmartAcc
       try {
         const entry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, "base64");
         assertEntryAddress(entry, config.address);
+        const request = capabilityRequestFor(entry);
+        if (request) assertCapability(capabilities, request);
         const payload = payloadHashForEntry(entry, networkPassphrase, expirationLedger);
         const signature = keypair.sign(payload);
         setSignatureMap(entry, ed25519SignerKey(rawPk), ed25519Signature(signature), policies);
@@ -282,19 +382,11 @@ export function createSessionKeySigner(config: SessionKeySignerConfig): SmartAcc
         await fire("deny", "error", networkPassphrase, err);
         throw err;
       }
-      const entry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, "base64");
-      assertEntryAddress(entry, config.address);
-      const request = capabilityRequestFor(entry);
-      if (request) assertCapability(capabilities, request);
-      const payload = payloadHashForEntry(entry, networkPassphrase, expirationLedger);
-      const signature = keypair.sign(payload);
-      setSignatureMap(entry, ed25519SignerKey(rawPk), ed25519Signature(signature), policies);
-      return entry.toXDR("base64");
     },
   };
 }
 
-// ── human (passkey / secp256r1) signer ─────────────────────────────────────────
+// ── human (passkey / secp256r1) signer ──────────────────────────────────────
 
 /** A WebAuthn assertion over a 32-byte payload hash. The `signature` is the raw
  * secp256r1 signature; `keyId` is the credential id (the wallet's Secp256r1 signer
@@ -329,6 +421,9 @@ export interface PasskeyX402SignerConfig {
   /** Client-side capability scoping (#224) — see
    * {@link SessionKeySignerConfig.capabilities}. Same semantics apply here. */
   capabilities?: readonly CapabilityRule[];
+  /** Declare whether the key is policy governed on chain — see
+   * {@link SessionKeySignerConfig.policyGoverned}. */
+  policyGoverned?: boolean;
 }
 
 /**
@@ -343,6 +438,11 @@ export function createPasskeyX402Signer(config: PasskeyX402SignerConfig): SmartA
   if (!isContractAddress(config.address)) {
     throw new Error(`passkey signer address must be a contract (C…): got ${config.address}`);
   }
+  warnIfPolicyGovernedWithoutPolicies(
+    "createPasskeyX402Signer",
+    config.policies ?? [],
+    config.policyGoverned,
+  );
   const onAction = config.onSignerAction;
   const fire = (
     action: X402SignerAction,
@@ -359,6 +459,8 @@ export function createPasskeyX402Signer(config: PasskeyX402SignerConfig): SmartA
       try {
         const entry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, "base64");
         assertEntryAddress(entry, config.address);
+        const request = capabilityRequestFor(entry);
+        if (request) assertCapability(capabilities, request);
         const payload = payloadHashForEntry(entry, networkPassphrase, expirationLedger);
         const assertion = await config.webAuthn.sign(new Uint8Array(payload));
         setSignatureMap(
@@ -374,19 +476,6 @@ export function createPasskeyX402Signer(config: PasskeyX402SignerConfig): SmartA
         await fire("deny", "error", networkPassphrase, err);
         throw err;
       }
-      const entry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, "base64");
-      assertEntryAddress(entry, config.address);
-      const request = capabilityRequestFor(entry);
-      if (request) assertCapability(capabilities, request);
-      const payload = payloadHashForEntry(entry, networkPassphrase, expirationLedger);
-      const assertion = await config.webAuthn.sign(new Uint8Array(payload));
-      setSignatureMap(
-        entry,
-        secp256r1SignerKey(assertion.keyId),
-        secp256r1Signature(assertion),
-        config.policies ?? [],
-      );
-      return entry.toXDR("base64");
     },
   };
 }

@@ -21,8 +21,10 @@ export interface BalanceReader {
 
 export interface BalanceService {
   getBalances(holder: string): Promise<TokenBalance[]>;
-  /** Fetch balances for many assets in one call; partial failures are per-item. */
-  getBalancesBatch(holder: string, tokens: TokenInfo[]): Promise<BatchBalanceResult[]>;
+  /** Fetch balances for many assets in one call; partial failures are per-item.
+   * Only the `contractId` of each token is read — symbol/decimals are metadata
+   * the caller already holds. */
+  getBalancesBatch(holder: string, tokens: Pick<TokenInfo, "contractId">[]): Promise<BatchBalanceResult[]>;
 }
 
 /** Maximum number of assets in a single batch balance request. */

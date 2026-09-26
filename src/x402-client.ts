@@ -42,6 +42,7 @@ import {
   assertValidX402RpcUrl,
   DisallowedAssetError,
   MaxAmountExceededError,
+  MissingPolicyCosignerError,
   NoUsablePaymentOptionError,
   PaymentRejectedError,
   type PaymentRequirements,
@@ -52,6 +53,10 @@ import {
   type X402PayOptions,
   type X402Response,
 } from "./x402-types";
+import {
+  looksLikeMissingPolicyCosigner,
+  missingPolicyCosignerError,
+} from "./x402-signer";
 
 // The pure guard layer is part of this module's published surface.
 export * from "./x402-guards";
@@ -307,11 +312,19 @@ export function createX402Client(deps: X402ClientDeps): X402Client {
 
     if (paid.status === 402 || paid.status >= 400) {
       const reason = extractRejectionReason(paid);
-      throw new PaymentRejectedError(
+      const detail =
         `x402 payment was not accepted (HTTP ${paid.status}${reason ? `: ${reason}` : ""}). ` +
-          `If this was over-budget, the on-chain policy rejected it at facilitator verify.`,
-        reason,
-      );
+        `If this was over-budget, the on-chain policy rejected it at facilitator verify.`;
+      // Issue #387: the wallet wraps EVERY auth failure in its generic
+      // `Error(Contract, #110)`. When that code surfaces with NO policy
+      // invocation in the diagnostics, the signature map is most likely missing
+      // the policy co-signers its key requires — a signer configuration error
+      // that reads identically to a policy refusal. Raise the typed error so
+      // the fix is named, instead of an opaque rejection.
+      if (reason !== undefined && looksLikeMissingPolicyCosigner(reason)) {
+        throw missingPolicyCosignerError(detail);
+      }
+      throw new PaymentRejectedError(detail, reason);
     }
 
     const settlement = readSettlement(paid, requirements, amount, deps.network);

@@ -99,6 +99,10 @@ for (const page of PAGES) {
     bodies.push(body.join("\n").trim());
   }
 
+  // Later blocks on a page frequently re-import a name (each snippet is meant
+  // to be copy-pasteable on its own). The Set dedupes imports — but two blocks
+  // declaring `const signer` at top level would still collide, so every block
+  // AFTER the first gets its own function scope (see `wrapped` below).
   const [first, ...rest] = bodies;
   const wrapped = rest
     .filter((b) => b.length > 0)

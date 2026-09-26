@@ -49,6 +49,7 @@ them means nothing was signed or submitted, so no money moved.
 | `NoUsablePaymentOptionError` | No offered option matched the scheme and network, or none advertised `areFeesSponsored: true` | No | Yes, against a facilitator that sponsors fees |
 | `InvalidRequirementsError` | A payment requirement was malformed, for example a non-integer amount | No | No, the seller's challenge has to be fixed first |
 | `PaymentRejectedError` | The facilitator rejected at the verify stage. Carries the reason. | No | Only after reading the reason and fixing the cause |
+| `MissingPolicyCosignerError` | The wallet refused the signature with its generic `Error(Contract, #110)` and the diagnostics show no policy was invoked — usually a policy-governed session key configured without its `policies`. If the signer IS configured with its policies, the cause is more likely a policy refusing an over-budget payment. | No | Yes, after passing every policy in the key's `SignerLimits` to the signer — or, if the policies are already configured, after raising the on-chain budget |
 | `X402NotConfiguredError` | `wallet.x402` used with no `x402` config. From 0.6.1 it is also thrown at construction when `rpcUrl` is missing, empty, or unparseable. | No | Yes, after adding the config |
 
 > **Note:** Amounts are bigints in the asset's base units. Stellar Asset

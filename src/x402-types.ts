@@ -221,3 +221,27 @@ export class InvalidRequirementsError extends Error {
     this.name = "InvalidRequirementsError";
   }
 }
+
+/**
+ * The WALLET rejected the signed payment inside `__check_auth` because the
+ * signature map did not carry the policy co-signers the signing key's
+ * `SignerLimits` require (issue #387).
+ *
+ * Why a dedicated class: the wallet wraps EVERY auth failure — including a
+ * policy refusing an over-budget payment — in its own generic
+ * `Error(Contract, #110)`, which reads as a broken signer rather than a missing
+ * co-signer. A key configured without its policies fails with that same opaque
+ * code and no diagnostic to say which fix applies. This error names the actual
+ * cause and the fix (configure `policies` on the signer) so the configuration
+ * mistake does not masquerade as a wallet/chain fault.
+ *
+ * Nothing was signed or settled by this error path: the classification happens
+ * on the FIRST request's rejection, before any retry. Caught by the same
+ * `Error` handling as the other x402 errors above.
+ */
+export class MissingPolicyCosignerError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MissingPolicyCosignerError";
+  }
+}

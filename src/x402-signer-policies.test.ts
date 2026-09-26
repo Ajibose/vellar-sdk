@@ -5,8 +5,15 @@
 // rather than a missing co-signer. These pin the map shape that works.
 
 import { Address, Keypair, xdr } from "@stellar/stellar-sdk";
-import { describe, expect, it } from "vitest";
-import { createSessionKeySigner } from "./x402-signer";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  createPasskeyX402Signer,
+  createSessionKeySigner,
+  MISSING_POLICY_COSIGNER_HINT,
+  looksLikeMissingPolicyCosigner,
+  missingPolicyCosignerError,
+} from "./x402-signer";
+import { MissingPolicyCosignerError } from "./x402-types";
 
 const WALLET = "CAFIATCEAZJTGQQKFL3N2YB6VMCUN2UYX4QD5A3FALDRU7UJJ6OWBKOW";
 const POLICY_A = "CC24EVD6SD7WF2U4GSIBGU7V6LCN3MLZOJZAZCRQNDS3X6KYIL45K2E3";
@@ -110,5 +117,115 @@ describe("policy co-signers in the signature map", () => {
         policies: ["GAVU25UK4ISUJIH6KWLXX6XDKKCR3GNZ27RZ5WABRSE42ZADV2LB3ZLU"],
       }),
     ).toThrow(/policy address must be a contract/);
+  });
+});
+
+// ── the policy-governed failure mode (issue #387) ────────────────────────────
+//
+// The wallet wraps EVERY auth failure in its generic Error(Contract, #110). A
+// policy-governed key configured WITHOUT its policies produces that same opaque
+// refusal with no diagnostic, and it must not be confused with a policy
+// refusing an over-budget payment (same #110, but a nested policy__ call).
+
+describe("policyGoverned declaration", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("warns when a key declared policy-governed carries no policies", () => {
+    createSessionKeySigner({
+      address: WALLET,
+      secretKey: Keypair.random().secret(),
+      policyGoverned: true,
+    });
+    expect(console.warn).toHaveBeenCalledTimes(1);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringMatching(/policyGoverned is set but .*policies.* is empty/));
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("Error(Contract, #110)"));
+  });
+
+  it("does not warn when policies accompany the declaration", () => {
+    createSessionKeySigner({
+      address: WALLET,
+      secretKey: Keypair.random().secret(),
+      policies: [POLICY_A],
+      policyGoverned: true,
+    });
+    expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  it("does not warn when the declaration is absent or false", () => {
+    createSessionKeySigner({ address: WALLET, secretKey: Keypair.random().secret() });
+    createSessionKeySigner({
+      address: WALLET,
+      secretKey: Keypair.random().secret(),
+      policyGoverned: false,
+    });
+    expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  it("warns for the passkey signer too", () => {
+    createPasskeyX402Signer({
+      address: WALLET,
+      webAuthn: { async sign() { throw new Error("not called"); } },
+      policyGoverned: true,
+    });
+    expect(console.warn).toHaveBeenCalledTimes(1);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("createPasskeyX402Signer"));
+  });
+});
+
+// Captured verbatim from testnet (shared with the mcp payer's fixtures). Both
+// carry the wallet's generic auth wrapper; only one shows a policy invocation.
+const MALFORMED_MAP_DIAGNOSTICS = `HostError: Error(Auth, InvalidAction)
+   0: [Diagnostic Event] contract:CBIELTK6, topics:[error, Error(Auth, InvalidAction)], data:["failed account authentication with error", CAFIATCE, Error(Contract, #110)]`;
+
+const POLICY_REFUSED_DIAGNOSTICS = `HostError: Error(Auth, InvalidAction)
+   0: [Diagnostic Event] contract:CBIELTK6, topics:[error, Error(Auth, InvalidAction)], data:["failed account authentication with error", CAFIATCE, Error(Contract, #110)]
+   1: [Failed Diagnostic Event] contract:CAFIATCE, topics:[error, Error(Contract, #110)], data:"escalating Ok(ScErrorType::Contract) frame-exit to Err"
+   2: [Failed Diagnostic Event] contract:CAFIATCE, topics:[error, Error(Contract, #1)], data:["contract try_call failed", policy__, [CAFIATCE, [Ed25519, Bytes(89b1)], [[Contract, {args: [CAFIATCE, GAVU25UK, 6000000], contract: CBIELTK6, fn_name: transfer}]]]]
+   3: [Failed Diagnostic Event] contract:CC24EVD6, topics:[log], data:["VM call trapped with HostError", policy__, Error(Contract, #1)]`;
+
+describe("looksLikeMissingPolicyCosigner", () => {
+  it("classifies a bare #110 with no policy invocation as a missing co-signer", () => {
+    expect(looksLikeMissingPolicyCosigner(MALFORMED_MAP_DIAGNOSTICS)).toBe(true);
+  });
+
+  it("does NOT classify a #110 whose nested policy call refused as a config error", () => {
+    // Same top-level code, different fix: this is the budget being enforced.
+    expect(looksLikeMissingPolicyCosigner(POLICY_REFUSED_DIAGNOSTICS)).toBe(false);
+  });
+
+  it("ignores failures that carry no #110 at all", () => {
+    expect(looksLikeMissingPolicyCosigner("Error(Contract, #1)"))
+      .toBe(false);
+    expect(looksLikeMissingPolicyCosigner("internal server error")).toBe(false);
+    expect(looksLikeMissingPolicyCosigner("Error(Contract, #11)"))
+      .toBe(false);
+  });
+});
+
+describe("missingPolicyCosignerError", () => {
+  it("names the cause, the fix, and the hint", () => {
+    const err = missingPolicyCosignerError(MALFORMED_MAP_DIAGNOSTICS);
+    expect(err).toBeInstanceOf(MissingPolicyCosignerError);
+    expect(err.name).toBe("MissingPolicyCosignerError");
+    expect(err.message).toContain(MISSING_POLICY_COSIGNER_HINT);
+    expect(err.message).toMatch(/pass every policy/i);
+    expect(err.message).toMatch(/createSessionKeySigner/);
+  });
+
+  it("preserves the raw diagnostics and the alternative cause", () => {
+    const err = missingPolicyCosignerError(MALFORMED_MAP_DIAGNOSTICS);
+    expect(err.message).toContain(MALFORMED_MAP_DIAGNOSTICS);
+    expect(err.message).toMatch(/policy refusing an over-budget payment/);
+  });
+
+  it("carries the hint constant verbatim for greppers", () => {
+    expect(MISSING_POLICY_COSIGNER_HINT).toBe(
+      "this signer may require policies to be configured",
+    );
   });
 });

@@ -368,7 +368,10 @@ Two signers ship, both satisfying the same `SmartAccountX402Signer` interface:
 Errors are typed: `MaxAmountExceededError`, `DisallowedAssetError`,
 `NoUsablePaymentOptionError`, `InvalidRequirementsError`, `PaymentRejectedError`
 (the facilitator rejected it — e.g. an over-budget payment blocked by the policy),
-and `X402NotConfiguredError` (no `x402` config). Lower-level: `createX402Client`
+`MissingPolicyCosignerError` (a policy-governed key signed without its `policies`
+— the wallet reports the generic `Error(Contract, #110)` for every auth failure,
+so the SDK classifies the diagnostics and names the fix), and
+`X402NotConfiguredError` (no `x402` config). Lower-level: `createX402Client`
 for a client without the wallet handle.
 
 > **Facilitator note:** a policy-governed payment runs the policy inside
