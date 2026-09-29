@@ -118,3 +118,82 @@ proposed `README.md` section. In short:
 
 > Note: `src/session.test.ts` does not currently parse on `dev` (an unterminated `it(` block in the
 > teardown suite), which must be fixed before these tests can be ported there.
+
+---
+
+## 6. A Clearer Failure Mode for Policy-Governed Signers (#387)
+
+We implement the diagnostics for the policy-governed failure mode inside
+[contrib/policy-governed-signer-failure-mode.ts](contrib/policy-governed-signer-failure-mode.ts),
+with unit tests in [contrib/policy-governed-signer-failure-mode.test.ts](contrib/policy-governed-signer-failure-mode.test.ts)
+and an end-to-end proof in [contrib/policy-governed-signer-failure-mode.e2e.test.ts](contrib/policy-governed-signer-failure-mode.e2e.test.ts).
+
+### Behavior
+
+- **The failure**: a policy-governed key configured WITHOUT its `policies` signs an
+  incomplete signature map, which the wallet rejects outright with `Error(Contract, #110)` —
+  the wallet's GENERIC auth-failure wrapper. It reads as a broken signer, and #110 also covers
+  policy refusals (over budget), so the code alone cannot say which fix applies. Verified on
+  testnet: an ed25519-only map against a policy-governed wallet fails with #110; the same
+  payment carrying the policy entries reaches the policy and is judged on its merits.
+- **`looksLikeMissingPolicyCosigner(detail)`**: true only when #110 is present AND the
+  diagnostics show no policy was ever invoked (`policy__` call absent). A policy refusal
+  produces the same #110 with a nested `policy__` diagnostic and must NOT reclassify.
+- **`missingPolicyCosignerError(detail)`**: the typed `MissingPolicyCosignerError` naming the
+  fix (pass every policy in the key's `SignerLimits` as `policies`), the greppable hint
+  constant, the alternative cause (a policy refusing an over-budget payment), and the raw
+  diagnostics. Nothing was signed or settled by this rejection path.
+- **`warnIfPolicyGovernedWithoutPolicies(kind, policies, policyGoverned)`**: warns (never
+  refuses) when a key DECLARED `policyGoverned` carries no policies — the one combination
+  that cannot work on chain, caught at construction before any RPC round-trip.
+- **`withMissingPolicyCosignerClassification(doFetch)`**: a catch-side wrapper that turns the
+  core client's generic `PaymentRejectedError` into the typed error for the missing-co-signer
+  shape only. This is the standalone integration path — use it around `wallet.x402.fetch(...)`
+  until core adopts the classification.
+
+The E2E test drives the REAL client on unmodified `dev` (real signing, real 402 loop, real
+XDR parsing; only the RPC transport and facilitator fetch are stubbed) and asserts the typed
+error reaches the caller with a genuinely signed envelope in the `PAYMENT-SIGNATURE` header.
+
+### Manual Run
+
+```sh
+npx vitest run contrib/policy-governed-signer-failure-mode.test.ts contrib/policy-governed-signer-failure-mode.e2e.test.ts
+```
+
+### Integration into Core
+
+A complete implementation of this recipe already exists as commit `a34a4d4` (PR #421, closed
+for touching files outside `contrib/`) on branch `feat/policy-governed-signer-failure-mode` —
+maintainers can cherry-pick from it directly. In summary:
+
+1. **`src/x402-types.ts`** — add the `MissingPolicyCosignerError` class (same shape as the one
+   in the contrib module) alongside the other x402 error classes.
+2. **`src/x402-signer.ts`** — move `MISSING_POLICY_COSIGNER_HINT`,
+   `looksLikeMissingPolicyCosigner` and `missingPolicyCosignerError` from the contrib module
+   (importing the error from `./x402-types`); add `policyGoverned?: boolean` to
+   `SessionKeySignerConfig` and `PasskeyX402SignerConfig`; call
+   `warnIfPolicyGovernedWithoutPolicies("createSessionKeySigner", policies, config.policyGoverned)`
+   at the top of both factories (after policy validation, before returning the signer).
+3. **`src/x402-client.ts`** — replace the generic rejection throw on the paid retry
+   (`throw new PaymentRejectedError(\`x402 payment was not accepted…\`, reason)`) with the
+   classifying version: build the `detail` string, and throw `missingPolicyCosignerError(detail)`
+   when `looksLikeMissingPolicyCosigner(detail)`, else the existing `PaymentRejectedError`.
+   Until this lands, consumers can wrap fetches with `withMissingPolicyCosignerClassification`
+   — no core change needed.
+4. **Docs** — add `MissingPolicyCosignerError` to the error-codes reference table and a short
+   `policyGoverned` note to the x402 docs page.
+
+> Prerequisite: `dev`'s `src/` currently has merge corruption that blocks the full suite
+> (see the closed PR's repair commit): `src/session.test.ts` is missing the closing braces
+> of the teardown suite before the "refresh & expiry edge cases" describe; `src/tx-rpc.ts`
+> calls the nonexistent `Transaction.fromXDR` (should be `TransactionBuilder.fromXDR(xdr,
+> networkPassphrase)`); `src/balances.ts` types `getBalancesBatch` tokens as full `TokenInfo[]`
+> (the implementation only reads `contractId` — `Pick<TokenInfo, "contractId">[]`); and
+> `src/x402-signer.ts` has a broken JSDoc comment (the capabilities block is missing its
+> `/**` opener, so the file does not PARSE — `npm run typecheck` fails on `dev`) plus
+> unreachable duplicate signing code after the `try/catch` in `createSessionKeySigner`
+> (harmless at runtime; both removed when integrating). The contrib tests
+> here do NOT depend on those repairs — they pass on unmodified `dev`, and import from
+> `../src/x402-client.js` / `../src/x402-types.js` directly to avoid the one module that
+> does not parse.
