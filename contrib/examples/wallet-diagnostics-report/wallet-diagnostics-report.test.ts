@@ -1,3 +1,4 @@
+import "../test-browser-context";
 import { describe, expect, it } from "vitest";
 import { createMockWallet, formatReport, runDiagnostics } from "./wallet-diagnostics-report";
 

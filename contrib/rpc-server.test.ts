@@ -19,6 +19,7 @@ describe("RpcServer backoff and circuit breaker (contrib)", () => {
 
     const server = new Server("https://mock-rpc-url.org");
     const promise = server.getLatestLedger();
+    const rejection = expect(promise).rejects.toThrow("RPC Degraded");
 
     // 1st attempt fails immediately.
     await vi.advanceTimersByTimeAsync(0);
@@ -37,7 +38,7 @@ describe("RpcServer backoff and circuit breaker (contrib)", () => {
     await vi.advanceTimersByTimeAsync(400);
     expect(getLatestLedgerSpy).toHaveBeenCalledTimes(4); // 1 initial + 3 retries = 4 attempts total
 
-    await expect(promise).rejects.toThrow("RPC Degraded");
+    await rejection;
   });
 
   it("circuit breaker transitions to OPEN after 5 failures and blocks requests", async () => {
@@ -47,7 +48,10 @@ describe("RpcServer backoff and circuit breaker (contrib)", () => {
     const server = new Server("https://mock-rpc-url-2.org");
 
     // Make 1 call that fails 4 times (1 initial + 3 retries). This records 4 failures on the breaker.
-    await expect(server.getLatestLedger()).rejects.toThrow("RPC Degraded");
+    const firstCall = server.getLatestLedger();
+    const firstRejection = expect(firstCall).rejects.toThrow("RPC Degraded");
+    await vi.runAllTimersAsync();
+    await firstRejection;
     expect(getLatestLedgerSpy).toHaveBeenCalledTimes(4);
 
     const breaker = getBreaker("https://mock-rpc-url-2.org");
@@ -57,9 +61,10 @@ describe("RpcServer backoff and circuit breaker (contrib)", () => {
     // Run one more call. The first attempt of this call will be the 5th failure.
     // This should immediately trip the breaker to OPEN.
     const promise = server.getLatestLedger();
-    await vi.advanceTimersByTimeAsync(0);
+    const rejection = expect(promise).rejects.toThrow(RpcCircuitBreakerError);
+    await vi.runAllTimersAsync();
 
-    await expect(promise).rejects.toThrow(RpcCircuitBreakerError);
+    await rejection;
     expect(breaker.state).toBe("OPEN");
     // Only 1 more call got through (the 5th failure). Retries were blocked by the breaker!
     expect(getLatestLedgerSpy).toHaveBeenCalledTimes(5);
@@ -78,9 +83,15 @@ describe("RpcServer backoff and circuit breaker (contrib)", () => {
 
     // Trip the breaker to OPEN: need 5 failures.
     // 1st request makes 4 attempts (4 failures)
-    await expect(server.getLatestLedger()).rejects.toThrow("RPC Degraded");
+    const firstCall = server.getLatestLedger();
+    const firstRejection = expect(firstCall).rejects.toThrow("RPC Degraded");
+    await vi.runAllTimersAsync();
+    await firstRejection;
     // 2nd request makes 1 attempt (5th failure) and trips breaker to OPEN
-    await expect(server.getLatestLedger()).rejects.toThrow(RpcCircuitBreakerError);
+    const secondCall = server.getLatestLedger();
+    const secondRejection = expect(secondCall).rejects.toThrow(RpcCircuitBreakerError);
+    await vi.runAllTimersAsync();
+    await secondRejection;
     expect(breaker.state).toBe("OPEN");
     expect(getLatestLedgerSpy).toHaveBeenCalledTimes(5);
 

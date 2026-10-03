@@ -1,3 +1,4 @@
+import "../test-browser-context";
 import { describe, expect, it } from "vitest";
 import { createMockVellarWallet, createMockWalletBackend } from "./mock-full-backend";
 
